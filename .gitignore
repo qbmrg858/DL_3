@@ -3,6 +3,5 @@
 *.csv
 *.pyc
 
-
 sub/
 ckpt/
