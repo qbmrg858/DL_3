@@ -210,13 +210,13 @@ class Trainer:
             losses, accs = [], []
             for xb, tb in zip(x_batches, t_batches):
                 yb = self.model(xb)
-                losses.append(crossentropy_loss(tb, yb))
+                losses.append(self.loss_fn(tb, yb))
                 accs.append(accuracy_score(tb.argmax(1), yb.argmax(1)))
                 delta = (yb - tb)
                 self.model.backward(delta)
                 self.model.update(self.params['lr'])
             yv = self.model(x_val)
-            val_loss = crossentropy_loss(t_val, yv)
+            val_loss = self.loss_fn(t_val, yv) + self.compute_l2_penalty()
             val_acc  = accuracy_score(t_val.argmax(1), yv.argmax(1))
             print(f"Epoch {epoch+1}/{self.params['n_epochs']} - Train loss:{np.mean(losses):.4f} acc:{np.mean(accs):.4f} | Val loss:{val_loss:.4f} acc:{val_acc:.4f}")
 
@@ -242,7 +242,11 @@ class Trainer:
                 callback.on_epoch_end(epoch, metrics, self)
 
         return self.model, val_acc
-    
+    def compute_l2_penalty(self):
+        l2_lambda = self.params['l2']
+        if l2_lambda == 0: return 0
+        return l2_lambda * sum(np.sum(layer.W ** 2) for layer in self.model.layers)
+
     def plot_learning_curves(self):
         epochs = range(1, len(self.history['train_loss']) + 1)
 
@@ -437,6 +441,9 @@ DEFAULT_PRAMS = {
 
     'activations': ['relu', 'relu', 'relu', 'softmax'],
     'layers': [784, 256, 128, 10],
+    'dropout': [0.0, 0.2, 0.2, 0.0],
+
+    'l2': 0.01,
 
     # 'lr_scheduler': 'linear',
     # 'lr_scheduler_params': {},
@@ -465,11 +472,10 @@ DEFAULT_PRAMS = {
 if __name__ == '__main__':
     # params = get_params()
     x_train, x_test, t_train = load_data()
-
-    # params = DEFAULT_PRAMS.copy()
+    params = DEFAULT_PRAMS.copy()
     # params = tune_hyperparameters(x_train, t_train, x_test, t_train, n_trials=100)
     # print("Best params after tuning:", params)
-    params = {'seed': 42, 'gamma_cor': 0.7361322989492523, 'lr': 0.08997383539561242, 'n_epochs': 100, 'batch_size': 63, 'activations': ['relu', 'relu', 'relu', 'softmax'], 'layers': [784, 256, 128, 10], 'lr_scheduler': 'one_cycle', 'lr_scheduler_params': {'max_lr': 0.5182702727643489, 'pct_start': 0.7390936926038417}, 'callback': [{'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_acc', 'mode': 'max'}}, {'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_loss', 'mode': 'min'}}]}
+    # params = {'seed': 42, 'gamma_cor': 0.7361322989492523, 'lr': 0.08997383539561242, 'n_epochs': 100, 'batch_size': 63, 'activations': ['relu', 'relu', 'relu', 'softmax'], 'layers': [784, 256, 128, 10], 'lr_scheduler': 'one_cycle', 'lr_scheduler_params': {'max_lr': 0.5182702727643489, 'pct_start': 0.7390936926038417}, 'callback': [{'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_acc', 'mode': 'max'}}, {'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_loss', 'mode': 'min'}}]}
     trainer = run_train(x_train, x_test, t_train, params)
     model_map = trainer.get_trained_models()
 
