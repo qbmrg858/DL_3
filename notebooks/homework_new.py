@@ -4,12 +4,20 @@ import sys
 import json
 import argparse
 import math
+from matplotlib import pyplot as plt
 import numpy as np
+import optuna
 import pandas as pd
 from datetime import datetime
 from sklearn.utils import shuffle
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
+
+
+# --- preprocessing ---
+def gamma_correction(x, gamma=1.0/2.0):
+    return np.power(x, gamma)
+
 
 # --- activation functions and their derivatives ---
 def relu(x):
@@ -50,11 +58,27 @@ def exp_decay(initial_lr, epoch, total_epochs, gamma=0.9, **kw):
 def cosine_annealing(initial_lr, epoch, total_epochs, eta_min=0, **kw):
     return eta_min + (initial_lr - eta_min) * (1 + math.cos(math.pi * epoch / total_epochs)) / 2
 
+def sgdr_cosine_annealing(initial_lr, epoch, total_epochs, T_0, T_mult=2, eta_min=0, **kwargs):
+    T_cur = epoch
+    T_i = T_0
+    while T_cur >= T_i:
+        T_cur -= T_i
+        T_i *= T_mult
+    return eta_min + 0.5 * (initial_lr - eta_min) * (1 + math.cos(math.pi * T_cur / T_i))
+
+def one_cycle_lr(initial_lr, epoch, total_epochs, max_lr=0.1, pct_start=0.3, **kwargs):
+    if epoch / total_epochs < pct_start:
+        return initial_lr + (max_lr - initial_lr) * (epoch / (pct_start * total_epochs))
+    else:
+        return max_lr * (1 - (epoch - pct_start * total_epochs) / ((1 - pct_start) * total_epochs))
+
 SCHEDULERS = {
     "linear": linear_decay,
     "step":   step_decay,
     "exp":    exp_decay,
     "cosine": cosine_annealing,
+    "sgdr": sgdr_cosine_annealing,
+    "one_cycle": one_cycle_lr,
 }
 
 #--- loss ---
@@ -63,7 +87,6 @@ def np_log(x):
 def crossentropy_loss(t, y):
     return -np.sum(t * np_log(y)) / t.shape[0]
 
-#--- Dense layer ---
 class Dense:
     def __init__(self, in_dim, out_dim, activation, deriv_activation):
         self.W = np.random.uniform(-0.08, 0.08, (in_dim, out_dim)).astype('float64')
@@ -90,7 +113,6 @@ class Dense:
     def get_grads(self):
         return self.dW, self.db
 
-#--- Model class ---
 class MLP:
     def __init__(self, layer_sizes, activation_names):
         self.layers = []
@@ -155,14 +177,21 @@ class Trainer:
         self.params = params.copy()
 
         self.metrics = {}
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'train_acc': [],
+            'val_acc': [],
+            'lr': [],
+        }
 
         self.initial_lr = self.params['lr']
 
     def model_state(self):
         state = {}
         for i, layer in enumerate(self.model.layers):
-            state[f"W{i}"] = layer.W
-            state[f"b{i}"] = layer.b
+            state[f"W{i}"] = layer.W.copy()
+            state[f"b{i}"] = layer.b.copy()
         return state
     
     def stop(self):
@@ -204,12 +233,51 @@ class Trainer:
                 "val_loss": val_loss,
                 "train_acc": np.mean(accs),
                 "val_acc": val_acc,
+                "lr": self.params['lr'],
             }
+            for key in self.history:
+                self.history[key].append(metrics[key])
 
             for callback in self.callbacks:
                 callback.on_epoch_end(epoch, metrics, self)
 
         return self.model, val_acc
+    
+    def plot_learning_curves(self):
+        epochs = range(1, len(self.history['train_loss']) + 1)
+
+        plt.figure(figsize=(14, 5))
+
+        # --- Loss Curve ---
+        plt.subplot(1, 2, 1)
+        plt.plot(epochs, self.history['train_loss'], label='Train Loss')
+        plt.plot(epochs, self.history['val_loss'], label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Loss Curve')
+        plt.legend()
+
+        # --- Accuracy Curve ---
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs, self.history['train_acc'], label='Train Acc')
+        plt.plot(epochs, self.history['val_acc'], label='Val Acc')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.title('Accuracy Curve')
+        plt.legend()
+
+        plt.show()
+    def plot_lr_curve(self):
+        epochs = range(1, len(self.history['lr']) + 1)
+
+        plt.figure(figsize=(7, 5))
+        plt.plot(epochs, self.history['lr'], label='Learning Rate')
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.title('Learning Rate Schedule')
+        plt.legend()
+        plt.show()
+
 
     def get_trained_models(self):
         callbacks = self.callbacks
@@ -269,50 +337,82 @@ def construct_callbacks(params):
             callbacks.append(ModelCheckpoint(**cb['ckpt']))
     return callbacks
 
-def get_params():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default=None)
-    args = parser.parse_args()
 
-    default = {
+# def get_params():
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument('--config', type=str, default=None)
+#     args = parser.parse_args()
+#     if args.config:
+#         with open(args.config) as f:
+#             params = json.load(f)
+#     else:
+#         params = default
+#     return params
+
+def tune_hyperparameters(x_train, t_train, x_val, t_val, n_trials=30):
+    def apply_best_params(base_params, best_params):
+        params = base_params.copy()
+
+        # 特別対応: ネストされた lr_scheduler_params などを区別する
+        for key, value in best_params.items():
+            if key in params.get('lr_scheduler_params', {}):
+                params['lr_scheduler_params'][key] = value
+            elif key in params:
+                params[key] = value
+            else:
+                # 該当なしならそのままトップレベルに追加
+                params[key] = value
+        return params
+
+    def objective(trial):
+        p = {
         'seed': 42,
+
+        'gamma_cor': trial.suggest_float('gamma_cor', 0.1, 2.0),
         
-        'lr': 0.5,
-        'n_epochs': 100,
-        'batch_size': 128,
+        'lr': trial.suggest_float('lr', 1e-4, 0.5, log=True),
+        'n_epochs': 20,
+        'batch_size': trial.suggest_int('batch_size', 32, 512),
 
-        'activations': ['relu', 'relu', 'relu', 'softmax'],
-        'layers': [784, 200, 100, 10],
+        'activations': ['relu', 'relu', 'relu', 'relu', 'softmax'],
+        'layers': [784, 512, 256, 128, 10],
 
-        'lr_scheduler': 'linear',
-        'lr_scheduler_params': {},
-
-        # 'lr_scheduler': 'step',
-        # 'lr_scheduler_params': {'step_size': 10, 'gamma': 0.1},
-
-        # 'lr_scheduler': 'exp',
-        # 'lr_scheduler_params': {'gamma': 0.9},
-
-        # 'lr_scheduler': 'cosine',
-        # 'lr_scheduler_params': {'eta_min': 0},
+        'lr_scheduler': 'one_cycle',
+        'lr_scheduler_params': {'max_lr': trial.suggest_float('max_lr', 0.51, 0.99),
+                                'pct_start': trial.suggest_float('pct_start', 0.1, 0.8)},
 
         'callback': [
             {'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_acc', 'mode': 'max'}},
             {'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_loss', 'mode': 'min'}},
         ]
-    }
-    if args.config:
-        with open(args.config) as f:
-            params = json.load(f)
-    else:
-        params = default
-    return params
+        }
+        np.random.seed(p['seed'])
+        x_train, x_test, t_train = load_data()
+        trainer = run_train(x_train, x_test, t_train, p)
+        best_acc = trainer.get_best_score()
+        print(f"[Trial {trial.number}] acc={best_acc:.4f}")
+        print(f"best_params={p}")
+        return best_acc
+    
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials)
+    
+    print("Best params:", study.best_params)
+    print("Best validation accuracy:", study.best_value)
+    best_params = study.best_params
 
-if __name__ == '__main__':
-    params = get_params()
+    best_params = apply_best_params(DEFAULT_PRAMS, best_params)
+    print("Best params after applying base params:\n", best_params)
+    return best_params
+
+def run_train(x_train, x_test, t_train, params):
     np.random.seed(params['seed'])
-    x_train, x_test, t_train = load_data()
     x_train, x_val, t_train, t_val = train_test_split(x_train, t_train, test_size=10000, random_state=params['seed'])
+    
+    x_train = gamma_correction(x_train, params['gamma_cor'])
+    x_val = gamma_correction(x_val, params['gamma_cor'])
+    x_test = gamma_correction(x_test, params['gamma_cor'])
+
     trainer = Trainer(
         model=MLP(params['layers'], params['activations']),
         optimizer=None,
@@ -321,6 +421,56 @@ if __name__ == '__main__':
         params=params
     )
     trainer.fit(x_train, t_train, x_val, t_val)
+    return trainer
+
+DEFAULT_PRAMS = {
+    'seed': 42,
+    
+    'gamma_cor': 0.8,
+
+    'lr': 0.0001,
+    'n_epochs': 100,
+    'batch_size': 128,
+
+    # 'activations': ['relu', 'relu', 'relu', 'relu', 'softmax'],
+    # 'layers': [784, 512, 256, 128, 10],
+
+    'activations': ['relu', 'relu', 'relu', 'softmax'],
+    'layers': [784, 256, 128, 10],
+
+    # 'lr_scheduler': 'linear',
+    # 'lr_scheduler_params': {},
+
+    # 'lr_scheduler': 'step',
+    # 'lr_scheduler_params': {'step_size': 10, 'gamma': 0.1},
+
+    # 'lr_scheduler': 'exp',
+    # 'lr_scheduler_params': {'gamma': 0.9},
+
+    # 'lr_scheduler': 'cosine',
+    # 'lr_scheduler_params': {'eta_min': 0},
+
+    # 'lr_scheduler': 'sgdr',
+    # 'lr_scheduler_params': {'T_0': 10, 'T_mult': 2, 'eta_min': 0.001},
+
+    'lr_scheduler': 'one_cycle',
+    'lr_scheduler_params': {'max_lr': 0.7, 'pct_start': 0.2},
+
+    'callback': [
+        {'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_acc', 'mode': 'max'}},
+        {'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_loss', 'mode': 'min'}},
+    ]
+}
+
+if __name__ == '__main__':
+    # params = get_params()
+    x_train, x_test, t_train = load_data()
+
+    # params = DEFAULT_PRAMS.copy()
+    # params = tune_hyperparameters(x_train, t_train, x_test, t_train, n_trials=100)
+    # print("Best params after tuning:", params)
+    params = {'seed': 42, 'gamma_cor': 0.7361322989492523, 'lr': 0.08997383539561242, 'n_epochs': 100, 'batch_size': 63, 'activations': ['relu', 'relu', 'relu', 'softmax'], 'layers': [784, 256, 128, 10], 'lr_scheduler': 'one_cycle', 'lr_scheduler_params': {'max_lr': 0.5182702727643489, 'pct_start': 0.7390936926038417}, 'callback': [{'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_acc', 'mode': 'max'}}, {'ckpt': {'dirpath': 'ckpt', 'monitor': 'val_loss', 'mode': 'min'}}]}
+    trainer = run_train(x_train, x_test, t_train, params)
     model_map = trainer.get_trained_models()
 
     for key, model in model_map.items():
@@ -330,3 +480,6 @@ if __name__ == '__main__':
             preds.extend(model(xb).argmax(1).tolist())
         
         save_sub_and_params(pd.Series(preds, name='label'), key)
+    
+    trainer.plot_learning_curves()
+    trainer.plot_lr_curve()
