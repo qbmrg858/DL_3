@@ -1,0 +1,8 @@
+*.npz
+*.json
+*.csv
+*.pyc
+
+
+sub/
+ckpt/

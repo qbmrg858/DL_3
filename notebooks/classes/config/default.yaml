@@ -1,0 +1,40 @@
+# config/default.yaml
+
+data:
+  filter_on: true
+  filter_type: gaussian  # mean | gaussian
+  gamma_on: true
+  gamma: 0.8
+
+model:
+  layers: [784, 100, 100, 10]
+  activation: ["relu", "relu", "softmax"]
+
+train:
+  lr: 0.01
+  batch_size: 128
+  n_epochs: 50
+  seed: 123
+
+callbacks:
+  checkpoint:
+    active: true
+    dir: "./checkpoints"
+    monitor: "val_acc"
+    mode: "max"
+  early_stopping:
+    active: true
+    patience: 5
+    monitor: "val_loss"
+    mode: "min"
+  swa:
+    active: true
+    swa_start: 10
+    swa_freq: 5
+  logger:
+    csv_log: "./logs/train.csv"
+
+optuna:
+  n_trials: 30
+  direction: maximize
+  # trial ごとに上書き可能なパラメータ名をここに列挙
